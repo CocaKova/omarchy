@@ -20,6 +20,7 @@ stub_log="$test_tmp/stubs"
 terminal_log="$test_tmp/terminal"
 menu_log="$test_tmp/menu"
 muse_login_log="$test_tmp/muse-login"
+reachable_log="$test_tmp/agent-reachable"
 mkdir -p "$mock_bin" "$test_home"
 
 cat >"$mock_bin/omarchy-install-chromium-claude" <<'SH'
@@ -39,6 +40,12 @@ SH
 cat >"$mock_bin/omarchy-cmd-missing" <<'SH'
 #!/bin/bash
 [[ $1 == ${OMARCHY_TEST_MISSING_COMMAND:-} ]]
+SH
+
+cat >"$mock_bin/omarchy-agent-host-reachable" <<'SH'
+#!/bin/bash
+printf '%s\n' "$1" >>"$OMARCHY_TEST_AGENT_REACHABLE_LOG"
+[[ ${OMARCHY_TEST_AGENT_HOST_UNREACHABLE:-false} != "true" ]]
 SH
 
 cat >"$mock_bin/omarchy-launch-tui" <<'SH'
@@ -118,6 +125,7 @@ export OMARCHY_TEST_STUB_LOG="$stub_log"
 export OMARCHY_TEST_AGENT_TERMINAL_LOG="$terminal_log"
 export OMARCHY_TEST_AGENT_MENU_LOG="$menu_log"
 export OMARCHY_TEST_MUSE_LOGIN_LOG="$muse_login_log"
+export OMARCHY_TEST_AGENT_REACHABLE_LOG="$reachable_log"
 export OMARCHY_PATH="$ROOT"
 
 grok_package="npm:@xai-official/grok"
@@ -825,3 +833,138 @@ mapfile -d '' -t launch_args <"$launch_log"
   ${launch_args[4]} == "Review this project" ]] ||
   fail "OpenClaw receives prompts through --message" "argv: ${launch_args[*]}"
 pass "OpenClaw receives prompts through --message"
+
+# Remote agents: the machine the agent runs on is the only thing that changes,
+# so every per-agent flag above has to survive the trip unaltered.
+host_file="$test_home/.config/omarchy/defaults/agent-host"
+
+omarchy-default-agent --host gpu-box
+[[ $(omarchy-default-agent --host) == "gpu-box" ]] || fail "the agent host is recorded and read back"
+pass "the agent host is recorded and read back"
+
+: >"$launch_log"
+remote_prompt=$' --help !Crash /quit {$(touch must-not-run)}\ntrailing\\ '
+printf '%s\n' "hermes" >"$agent_file"
+omarchy-agent-prompt "$remote_prompt"
+mapfile -d '' -t launch_args <"$launch_log"
+[[ ${#launch_args[@]} == 10 &&
+  ${launch_args[0]} == "--app-id=org.omarchy.agent" &&
+  ${launch_args[1]} == "ssh" &&
+  ${launch_args[2]} == "-t" &&
+  ${launch_args[7]} == "gpu-box" &&
+  ${launch_args[8]} == "--" ]] ||
+  fail "a remote agent launches over ssh" "argv: ${launch_args[*]}"
+[[ ${launch_args[9]} == "bash -lic "* ]] ||
+  fail "a remote agent runs through a login+interactive shell" "argv: ${launch_args[9]}"
+pass "a remote agent launches over ssh under the shared app-id"
+
+# Parsed twice, because the far side parses twice: the login shell ssh hands
+# the line to resolves one layer and passes bash a single command string, which
+# bash then splits into argv. A prompt carrying quotes, newlines and a command
+# substitution has to survive both as one literal argument rather than as
+# something the far side runs.
+remote_command=$(eval "printf '%s' ${launch_args[9]#bash -lic }")
+# ssh lands in the remote $HOME, the one directory agents refuse to remember
+# trust for, so the far side gets the same redirect a local launch from $HOME
+# gets.
+[[ $remote_command == '[[ -d ~/Work ]] && cd ~/Work; exec '* ]] ||
+  fail "a remote agent starts outside the remote home" "command: $remote_command"
+mapfile -d '' -t remote_argv < <(eval "printf '%s\0' ${remote_command#*; exec }")
+[[ ${#remote_argv[@]} == 8 &&
+  ${remote_argv[0]} == "env" &&
+  ${remote_argv[6]} == "--tui" &&
+  ${remote_argv[7]} == "--query=$remote_prompt" ]] ||
+  fail "the remote command survives quoting intact" "argv: ${remote_argv[*]}"
+[[ ! -e must-not-run ]] || fail "a prompt cannot run commands on the remote host"
+pass "the remote command and its prompt survive quoting intact"
+
+: >"$launch_log"
+: >"$mise_history"
+: >"$terminal_log"
+OMARCHY_TEST_MISSING_COMMAND=claude omarchy-default-agent claude
+read -r chosen <"$agent_file"
+[[ $chosen == claude ]] || fail "choosing a remote agent records it"
+[[ ! -s $mise_history && ! -s $terminal_log ]] ||
+  fail "a remote agent is never installed locally"
+mapfile -d '' -t launch_args <"$launch_log"
+[[ ${launch_args[1]} == "ssh" ]] ||
+  fail "an agent missing locally still launches remotely" "argv: ${launch_args[*]}"
+pass "a remote agent is chosen without installing it locally"
+
+: >"$launch_log"
+omarchy-default-agent --host ""
+[[ ! -f $host_file ]] || fail "clearing the agent host removes the file"
+[[ -z $(omarchy-default-agent --host) ]] || fail "a cleared agent host reads back empty"
+printf '%s\n' "pi" >"$agent_file"
+omarchy-agent
+assert_launched pi "runs locally again once the host is cleared" pi
+pass "clearing the agent host returns the agent to this machine"
+
+# Work that is about this machine cannot be done from another one, so it stays
+# here whatever the default agent's usual home is.
+: >"$launch_log"
+omarchy-default-agent --host gpu-box
+printf '%s\n' "pi" >"$agent_file"
+omarchy-agent --local
+assert_launched pi "stays on this machine with --local" pi
+pass "--local runs the agent here even when it normally runs elsewhere"
+
+: >"$launch_log"
+printf '%s\n' "claude" >"$agent_file"
+omarchy-agent-crash 1234 hyprland /usr/bin/hyprland SIGSEGV
+mapfile -d '' -t launch_args <"$launch_log"
+[[ ${launch_args[1]} == "claude" ]] ||
+  fail "crash diagnosis runs on the machine that crashed" "argv: ${launch_args[*]}"
+[[ ${launch_args[*]} == *"diagnose-crash"* ]] ||
+  fail "crash diagnosis still points at the skill" "argv: ${launch_args[*]}"
+pass "crash diagnosis runs on the machine that crashed, not the agent's host"
+
+# A remote agent is not installed here, so the local probe must not be the thing
+# that decides whether it can run -- but it still guards a local launch.
+: >"$launch_log"
+if OMARCHY_TEST_MISSING_COMMAND=claude omarchy-agent --local >"$test_tmp/local-missing" 2>&1; then
+  fail "--local still reports an agent that is missing here"
+fi
+grep -q "not installed" "$test_tmp/local-missing" ||
+  fail "--local explains that the agent is missing here" "$(cat "$test_tmp/local-missing")"
+pass "--local reports an agent that is missing on this machine"
+
+omarchy-default-agent --host ""
+
+# An unreachable machine has to say so: a terminal that opens and closes again
+# is the least informative way to report it.
+: >"$launch_log"
+: >"$notification_history"
+omarchy-default-agent --host gpu-box
+printf '%s\n' "hermes" >"$agent_file"
+if OMARCHY_TEST_AGENT_HOST_UNREACHABLE=true omarchy-agent; then
+  fail "an unreachable agent host fails the launch"
+fi
+[[ ! -s $launch_log ]] || fail "an unreachable agent host opens no window" "argv: $(cat "$launch_log")"
+mapfile -d '' -t notification <"$notification_history"
+[[ ${notification[*]} == *"gpu-box"* ]] ||
+  fail "an unreachable agent host is reported on the desktop" "notification: ${notification[*]}"
+pass "an unreachable agent host is reported instead of flashing a window"
+
+: >"$notification_history"
+if OMARCHY_TEST_AGENT_HOST_UNREACHABLE=true omarchy-agent --inline >"$test_tmp/unreachable-inline" 2>&1; then
+  fail "an unreachable agent host fails an inline launch"
+fi
+[[ ! -s $notification_history ]] ||
+  fail "an inline launch reports in the terminal rather than on the desktop"
+grep -q "omarchy agent --local" "$test_tmp/unreachable-inline" ||
+  fail "an unreachable agent host points at the local escape hatch" "$(cat "$test_tmp/unreachable-inline")"
+pass "an inline launch reports an unreachable host in the terminal it was run from"
+
+: >"$reachable_log"
+omarchy-agent
+[[ $(cat "$reachable_log") == "gpu-box" ]] ||
+  fail "the reachability check is asked about the configured host" "asked: $(cat "$reachable_log")"
+pass "the agent host is checked before its window is spawned"
+
+: >"$reachable_log"
+omarchy-agent --local
+[[ ! -s $reachable_log ]] || fail "--local never probes a remote host"
+pass "--local skips the reachability check entirely"
+
+omarchy-default-agent --host ""
