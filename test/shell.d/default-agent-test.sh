@@ -21,8 +21,12 @@ terminal_log="$test_tmp/terminal"
 menu_log="$test_tmp/menu"
 muse_login_log="$test_tmp/muse-login"
 reachable_log="$test_tmp/agent-reachable"
-ssh_kill_log="$test_tmp/ssh-kill"
-mkdir -p "$mock_bin" "$test_home"
+far_home="$test_tmp/far-home"
+far_bin="$test_tmp/far-bin"
+tmux_sessions="$test_tmp/tmux-sessions"
+tmux_log="$test_tmp/tmux-log"
+far_agent_log="$test_tmp/far-agent"
+mkdir -p "$mock_bin" "$test_home" "$far_home/Work" "$far_bin"
 
 cat >"$mock_bin/omarchy-install-chromium-claude" <<'SH'
 #!/bin/bash
@@ -49,29 +53,74 @@ printf '%s\n' "$1" >>"$OMARCHY_TEST_AGENT_REACHABLE_LOG"
 [[ ${OMARCHY_TEST_AGENT_HOST_UNREACHABLE:-false} != "true" ]]
 SH
 
-# Answers the two questions omarchy-agent-stop asks a remote machine, and
-# records the kills so the test can tell one from several.
+# The far side of an ssh launch. It runs the script the way the remote login
+# shell's bash would, with the base64 the launcher wrapped it in decoded, in a
+# home and a PATH of its own so nothing on this machine answers for the remote.
+cat >"$mock_bin/omarchy-test-far-side" <<'SH'
+#!/bin/bash
+remote=$1
+[[ $remote =~ printf\ %s\ ([A-Za-z0-9+/=]+)\ \| ]] || {
+  echo "far side got no script: $remote" >&2
+  exit 2
+}
+cd "$OMARCHY_TEST_FAR_HOME" &&
+  exec env HOME="$OMARCHY_TEST_FAR_HOME" PATH="$OMARCHY_TEST_FAR_BIN:/usr/bin:/bin" \
+    bash -c "$(base64 -d <<<"${BASH_REMATCH[1]}")"
+SH
+
 cat >"$mock_bin/ssh" <<'SH'
 #!/bin/bash
-remote=${!#}
+exec omarchy-test-far-side "${!#}"
+SH
 
-case $remote in
-*list-sessions*)
-  if [[ -n ${OMARCHY_TEST_TMUX_SESSIONS:-} ]]; then
-    printf '%s\n' "$OMARCHY_TEST_TMUX_SESSIONS"
-  fi
+# Enough of tmux to hold sessions between calls: the far side asks whether one
+# exists, makes one, lists them and ends them, and each answer depends on the
+# calls before it.
+cat >"$far_bin/tmux" <<'SH'
+#!/bin/bash
+# One call per line, quoted, so a test can read any call back as its argv.
+printf '%q ' "$@" >>"$OMARCHY_TEST_TMUX_LOG"
+printf '\n' >>"$OMARCHY_TEST_TMUX_LOG"
+touch "$OMARCHY_TEST_TMUX_SESSIONS"
+
+case $1 in
+-V)
+  [[ ${OMARCHY_TEST_NO_TMUX:-false} != "true" ]]
   ;;
-*kill-session*)
-  # eval because the far side is a shell: the session name arrives quoted and
-  # is unquoted by the shell that runs tmux, not handed over with its quotes.
-  eval "printf '%s\n' ${remote#tmux kill-session -t }" >>"$OMARCHY_TEST_SSH_KILL_LOG"
+has-session)
+  grep -Fxq "${3#=}" "$OMARCHY_TEST_TMUX_SESSIONS"
+  ;;
+new-session)
+  printf '%s\n' "$4" >>"$OMARCHY_TEST_TMUX_SESSIONS"
+  ;;
+list-sessions)
+  if [[ -n ${OMARCHY_TEST_TMUX_LIST_ERROR:-} ]]; then
+    echo "$OMARCHY_TEST_TMUX_LIST_ERROR" >&2
+    exit 1
+  fi
+  [[ -s $OMARCHY_TEST_TMUX_SESSIONS ]] || {
+    echo "no server running on /tmp/tmux-1000/default" >&2
+    exit 1
+  }
+  cat "$OMARCHY_TEST_TMUX_SESSIONS"
+  ;;
+kill-session)
+  name=${3#=}
+  grep -Fxq "$name" "$OMARCHY_TEST_TMUX_SESSIONS" || exit 1
+  grep -Fxv "$name" "$OMARCHY_TEST_TMUX_SESSIONS" >"$OMARCHY_TEST_TMUX_SESSIONS.new" || true
+  mv "$OMARCHY_TEST_TMUX_SESSIONS.new" "$OMARCHY_TEST_TMUX_SESSIONS"
   ;;
 esac
-
-# A trailing conditional would leave the mock exiting 1 and the caller reading
-# a reachable host as unreachable.
-exit 0
 SH
+
+# The agents themselves, for a far side without tmux.
+for far_agent in hermes pi; do
+  cat >"$far_bin/$far_agent" <<SH
+#!/bin/bash
+printf '%s\\0' $far_agent "\$@" >"\$OMARCHY_TEST_FAR_AGENT_LOG"
+SH
+done
+chmod +x "$far_bin"/*
 
 cat >"$mock_bin/omarchy-launch-tui" <<'SH'
 #!/bin/bash
@@ -151,7 +200,11 @@ export OMARCHY_TEST_AGENT_TERMINAL_LOG="$terminal_log"
 export OMARCHY_TEST_AGENT_MENU_LOG="$menu_log"
 export OMARCHY_TEST_MUSE_LOGIN_LOG="$muse_login_log"
 export OMARCHY_TEST_AGENT_REACHABLE_LOG="$reachable_log"
-export OMARCHY_TEST_SSH_KILL_LOG="$ssh_kill_log"
+export OMARCHY_TEST_FAR_HOME="$far_home"
+export OMARCHY_TEST_FAR_BIN="$far_bin"
+export OMARCHY_TEST_TMUX_SESSIONS="$tmux_sessions"
+export OMARCHY_TEST_TMUX_LOG="$tmux_log"
+export OMARCHY_TEST_FAR_AGENT_LOG="$far_agent_log"
 export OMARCHY_PATH="$ROOT"
 
 grok_package="npm:@xai-official/grok"
@@ -884,49 +937,124 @@ done
   ${launch_args[separator - 1]} == "gpu-box" &&
   ${launch_args[separator]} == "--" ]] ||
   fail "a remote agent launches over ssh" "argv: ${launch_args[*]}"
-[[ ${launch_args[*]} == *"ControlPath="* ]] ||
-  fail "a remote agent reuses one connection" "argv: ${launch_args[*]}"
+[[ ${launch_args[*]} == *"ControlPath="*"%C"* ]] ||
+  fail "a remote agent reuses one connection through a short socket path" "argv: ${launch_args[*]}"
 remote_shell_command=${launch_args[separator + 1]}
-[[ $remote_shell_command == "bash -lic "* ]] ||
-  fail "a remote agent runs through a login+interactive shell" "argv: $remote_shell_command"
 pass "a remote agent launches over ssh under the shared app-id"
 
-# Parsed twice, because the far side parses twice: the login shell ssh hands
-# the line to resolves one layer and passes bash a single command string, which
-# bash then splits into argv. A prompt carrying quotes, newlines and a command
-# substitution has to survive both as one literal argument rather than as
-# something the far side runs.
-remote_command=$(eval "printf '%s' ${remote_shell_command#bash -lic }")
-# ssh lands in the remote $HOME, the one directory agents refuse to remember
-# trust for, so the far side gets the same redirect a local launch from $HOME
-# gets.
-[[ $remote_command == '[[ -d ~/Work ]] && cd ~/Work'* ]] ||
-  fail "a remote agent starts outside the remote home" "command: $remote_command"
+# The remote login shell reads this line before bash does, and it may be fish,
+# which has no $'...' and reads backslashes inside single quotes. So the line
+# carries nothing but plain single quotes around text no shell interprets.
+[[ $remote_shell_command =~ ^bash\ -lic\ \'[^\'\\]*\'$ ]] ||
+  fail "the ssh command means the same thing to every login shell" "command: $remote_shell_command"
+pass "the ssh command means the same thing to every login shell"
 
-# The session outlives its window, and a second launch joins the one already
-# there rather than starting a rival agent over the top of it.
-tmux_line=$(grep -F 'exec tmux new-session' <<<"$remote_command") ||
-  fail "a remote agent runs inside tmux" "command: $remote_command"
-[[ $tmux_line == *"new-session -A -s"* ]] ||
-  fail "a second launch attaches instead of starting a rival agent" "line: $tmux_line"
+# Reads the tmux calls the far side made back into argv, one call at a time.
+tmux_calls() {
+  local subcommand=$1 line
+  local -a call
 
-# A machine without tmux still runs the agent, so the command appears twice and
-# both copies have to be quoted correctly.
-grep -qE '^exec ' <<<"$remote_command" ||
-  fail "a remote machine without tmux still runs the agent" "command: $remote_command"
+  while IFS= read -r line; do
+    eval "call=($line)"
+    [[ ${call[0]} == "$subcommand" ]] && printf '%s\0' "${call[@]}"
+  done <"$tmux_log"
+}
 
-# Two more parses on this path: bash reads the line and hands tmux one
-# argument, and tmux hands that to sh, which splits it into the agent's argv.
-tmux_argument=${tmux_line#*-s \"\$session\" }
-sh_command=$(eval "printf '%s' $tmux_argument")
-mapfile -d '' -t remote_argv < <(eval "printf '%s\0' $sh_command")
+# The far side runs the agent in a new tmux session named for the agent and the
+# directory, starts it in ~/Work, and runs the agent's own argv with no shell in
+# between: tmux execs a command given as separate words, so the prompt reaches
+# the agent as one literal argument and nothing in it runs.
+: >"$tmux_sessions"
+: >"$tmux_log"
+omarchy-test-far-side "$remote_shell_command"
+mapfile -d '' -t new_session < <(tmux_calls new-session)
+[[ ${new_session[2]:-} == "-s" && ${new_session[3]:-} == "omarchy-agent-hermes-Work" ]] ||
+  fail "a remote agent runs in a tmux session named for it and ~/Work" "argv: ${new_session[*]}"
+[[ ${new_session[1]:-} == "-d" && ${new_session[8]:-} == "env" && ${new_session[9]:-} == PATH=* ]] ||
+  fail "the remote agent keeps the far side's PATH inside tmux" "argv: ${new_session[*]}"
+remote_argv=("${new_session[@]:10}")
 [[ ${#remote_argv[@]} == 8 &&
-  ${remote_argv[0]} == "env" &&
-  ${remote_argv[6]} == "--tui" &&
-  ${remote_argv[7]} == "--query=$remote_prompt" ]] ||
+  ${remote_argv[0]:-} == "env" &&
+  ${remote_argv[6]:-} == "--tui" &&
+  ${remote_argv[7]:-} == "--query=$remote_prompt" ]] ||
   fail "the remote command survives quoting intact" "argv: ${remote_argv[*]}"
-[[ ! -e must-not-run ]] || fail "a prompt cannot run commands on the remote host"
+[[ ! -e $far_home/Work/must-not-run && ! -e must-not-run ]] ||
+  fail "a prompt cannot run commands on the remote host"
 pass "the remote command and its prompt survive quoting intact"
+
+# Omarchy's tmux.conf turns detach-on-destroy off, which would carry the window
+# into another session when this one ends rather than closing it.
+mapfile -d '' -t set_option < <(tmux_calls set-option)
+[[ ${set_option[*]} == "set-option -t =omarchy-agent-hermes-Work: detach-on-destroy on" ]] ||
+  fail "the agent's session detaches its window when it ends" "argv: ${set_option[*]}"
+mapfile -d '' -t attach < <(tmux_calls attach-session)
+[[ ${attach[*]} == "attach-session -t =omarchy-agent-hermes-Work" ]] ||
+  fail "the window attaches to the agent's session" "argv: ${attach[*]}"
+pass "a remote agent outlives its window and ends it when it ends"
+
+# A second prompt is new work. tmux ignores the command of a session that
+# already exists, so attaching would drop the prompt: it gets its own session.
+: >"$tmux_log"
+omarchy-test-far-side "$remote_shell_command"
+mapfile -d '' -t new_session < <(tmux_calls new-session)
+[[ ${new_session[3]:-} == "omarchy-agent-hermes-Work-2" && ${new_session[17]:-} == "--query=$remote_prompt" ]] ||
+  fail "a prompt given while a session runs starts a new one" "argv: ${new_session[*]}"
+pass "a prompt given while a session runs is delivered to a new one"
+
+# The agent key with no prompt resumes the conversation that is already there.
+: >"$launch_log"
+: >"$tmux_log"
+omarchy-agent
+mapfile -d '' -t launch_args <"$launch_log"
+omarchy-test-far-side "${launch_args[-1]}"
+[[ -z $(tmux_calls new-session) ]] ||
+  fail "the agent key starts no rival agent over a running one" "tmux: $(cat "$tmux_log")"
+mapfile -d '' -t attach < <(tmux_calls attach-session)
+[[ ${attach[*]} == "attach-session -t =omarchy-agent-hermes-Work" ]] ||
+  fail "the agent key resumes the running session" "argv: ${attach[*]}"
+pass "the agent key resumes the session already running there"
+
+# Switching the default agent starts that agent, rather than reopening the one
+# the old default left running.
+: >"$launch_log"
+: >"$tmux_log"
+printf '%s\n' "pi" >"$agent_file"
+omarchy-agent
+mapfile -d '' -t launch_args <"$launch_log"
+omarchy-test-far-side "${launch_args[-1]}"
+mapfile -d '' -t new_session < <(tmux_calls new-session)
+[[ ${new_session[3]:-} == "omarchy-agent-pi-Work" && ${new_session[10]:-} == "pi" ]] ||
+  fail "a different default agent gets a session of its own" "argv: ${new_session[*]}"
+pass "switching the default agent starts it rather than reopening the old one"
+
+# A machine without tmux still runs the agent, just without the session.
+: >"$far_agent_log"
+printf '%s\n' "hermes" >"$agent_file"
+OMARCHY_TEST_NO_TMUX=true omarchy-test-far-side "$remote_shell_command"
+mapfile -d '' -t remote_argv <"$far_agent_log"
+[[ ${remote_argv[0]:-} == "hermes" && ${remote_argv[-1]:-} == "--query=$remote_prompt" ]] ||
+  fail "a remote machine without tmux still runs the agent" "argv: ${remote_argv[*]}"
+pass "a remote machine without tmux still runs the agent"
+
+# An agent missing over there says so where the window can show it, rather
+# than failing inside a tmux session that closes the window with it.
+: >"$launch_log"
+: >"$tmux_log"
+printf '%s\n' "codex" >"$agent_file"
+omarchy-agent
+mapfile -d '' -t launch_args <"$launch_log"
+if omarchy-test-far-side "${launch_args[-1]}" </dev/null >"$test_tmp/far-missing" 2>&1; then
+  fail "an agent missing on the remote host fails the launch"
+fi
+grep -q "codex is not installed on" "$test_tmp/far-missing" ||
+  fail "an agent missing on the remote host is named" "$(cat "$test_tmp/far-missing")"
+grep -q "omarchy agent --local" "$test_tmp/far-missing" ||
+  fail "an agent missing on the remote host points at --local" "$(cat "$test_tmp/far-missing")"
+[[ -z $(tmux_calls new-session) ]] ||
+  fail "an agent missing on the remote host starts no session" "tmux: $(cat "$tmux_log")"
+pass "an agent missing on the remote host is reported there"
+printf '%s\n' "hermes" >"$agent_file"
+: >"$tmux_sessions"
 
 : >"$launch_log"
 : >"$mise_history"
@@ -992,7 +1120,7 @@ if OMARCHY_TEST_AGENT_HOST_UNREACHABLE=true omarchy-agent; then
 fi
 [[ ! -s $launch_log ]] || fail "an unreachable agent host opens no window" "argv: $(cat "$launch_log")"
 mapfile -d '' -t notification <"$notification_history"
-[[ ${notification[*]} == *"gpu-box"* ]] ||
+[[ ${notification[*]} == *"gpu-box"* && ${notification[*]} == *"omarchy agent --local"* ]] ||
   fail "an unreachable agent host is reported on the desktop" "notification: ${notification[*]}"
 pass "an unreachable agent host is reported instead of flashing a window"
 
@@ -1030,25 +1158,43 @@ grep -q "runs on this machine" "$test_tmp/stop-local" ||
 pass "there is nothing to stop when the agent runs on this machine"
 
 omarchy-default-agent --host gpu-box
-: >"$ssh_kill_log"
-OMARCHY_TEST_TMUX_SESSIONS="" omarchy-agent-stop >"$test_tmp/stop-none" 2>&1
+: >"$tmux_sessions"
+: >"$tmux_log"
+omarchy-agent-stop >"$test_tmp/stop-none" 2>&1 ||
+  fail "an idle host is not an error" "$(cat "$test_tmp/stop-none")"
 grep -q "No agent session" "$test_tmp/stop-none" ||
   fail "an idle host says so" "$(cat "$test_tmp/stop-none")"
-[[ ! -s $ssh_kill_log ]] || fail "an idle host has nothing killed on it"
+[[ -z $(tmux_calls kill-session) ]] || fail "an idle host has nothing killed on it"
 pass "stopping an idle host reports that nothing was running"
 
-# Every session, not just the first: ssh reads stdin, so a loop that feeds it
-# the list it is still reading ends one session and silently swallows the rest.
-: >"$ssh_kill_log"
-OMARCHY_TEST_TMUX_SESSIONS=$'omarchy-agent-work\nomarchy-agent-notes' omarchy-agent-stop >/dev/null 2>&1
-[[ $(wc -l <"$ssh_kill_log") == 2 ]] ||
-  fail "every remote agent session is ended" "killed: $(cat "$ssh_kill_log")"
+# Every session this launcher started, and none it did not.
+printf '%s\n' omarchy-agent-claude-Work notes omarchy-agent-pi-Work >"$tmux_sessions"
+omarchy-agent-stop >"$test_tmp/stop-all" 2>&1 ||
+  fail "stopping every agent session succeeds" "$(cat "$test_tmp/stop-all")"
+[[ $(cat "$tmux_sessions") == "notes" ]] ||
+  fail "every remote agent session is ended, and only those" "left: $(cat "$tmux_sessions")"
+[[ $(grep -c "^Ended" "$test_tmp/stop-all") == 2 ]] ||
+  fail "each ended session is reported" "$(cat "$test_tmp/stop-all")"
 pass "stopping a remote agent ends every session it started"
 
-: >"$ssh_kill_log"
-OMARCHY_TEST_TMUX_SESSIONS=$'omarchy-agent-work\nomarchy-agent-notes' omarchy-agent-stop notes >/dev/null 2>&1
-[[ $(cat "$ssh_kill_log") == "omarchy-agent-notes" ]] ||
-  fail "a named session is the only one ended" "killed: $(cat "$ssh_kill_log")"
+printf '%s\n' omarchy-agent-claude-Work omarchy-agent-pi-Work >"$tmux_sessions"
+omarchy-agent-stop pi-Work >/dev/null 2>&1
+[[ $(cat "$tmux_sessions") == "omarchy-agent-claude-Work" ]] ||
+  fail "a named session is the only one ended" "left: $(cat "$tmux_sessions")"
 pass "a named session is the only one ended"
+
+omarchy-agent-stop nope >"$test_tmp/stop-unknown" 2>&1
+grep -q "No agent session named omarchy-agent-nope" "$test_tmp/stop-unknown" ||
+  fail "a session name that matches nothing says so" "$(cat "$test_tmp/stop-unknown")"
+pass "a session name that matches nothing says so"
+
+# A tmux that cannot answer is a failure, not an idle host.
+if OMARCHY_TEST_TMUX_LIST_ERROR="permission denied" omarchy-agent-stop >"$test_tmp/stop-error" 2>&1; then
+  fail "a tmux that cannot list its sessions fails the stop"
+fi
+grep -q "permission denied" "$test_tmp/stop-error" ||
+  fail "a failed listing says why" "$(cat "$test_tmp/stop-error")"
+pass "a tmux that cannot list its sessions is reported, not read as idle"
+: >"$tmux_sessions"
 
 omarchy-default-agent --host ""

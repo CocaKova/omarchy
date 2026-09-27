@@ -163,49 +163,98 @@ if [[ -n $agent_host ]]; then
       echo "Run it on this machine instead with: omarchy agent --local" >&2
     else
       omarchy-notification-send -u critical "Agent host unreachable" \
-        "Cannot reach $agent_host, where $agent runs."
+        "Cannot reach $agent_host, where $agent runs. Run it here instead with: omarchy agent --local"
     fi
 
     exit 1
   fi
 
-  agent_command=${command[*]@Q}
+  # Built as a script because the far side has several things to do. Only bash
+  # ever parses it: the agent command inside was quoted by bash here, and tmux
+  # is handed that command as separate words, which it runs without a shell,
+  # so neither the remote login shell nor tmux's default-shell reads a prompt.
+  remote_script="agent=${agent@Q} fresh=${prompt:+true}
+command=(${command[*]@Q})
+$(cat <<'REMOTE'
+[[ -d ~/Work ]] && cd ~/Work
 
-  # Built as a script rather than a one-liner because the far side has three
-  # things to do, and each line is quoted for the shell that will actually read
-  # it -- bash here, then sh inside tmux.
-  #
-  # Probed by running it, the way this repo probes any other command it does
-  # not own -- and omarchy-cmd-present is no help here, since the command being
-  # asked about is on the other machine.
-  #
-  # tmux is what makes a remote agent survive its window: a closed lid or a
-  # dropped tunnel would otherwise kill work on a machine that is still running
-  # fine. -A attaches to the session if it exists rather than starting a second
-  # agent over the top of the first, so the keybinding resumes what is already
-  # there. A machine without tmux runs the agent directly.
-  remote_command="[[ -d ~/Work ]] && cd ~/Work
-session=omarchy-agent-\${PWD##*/}
-session=\${session//[^[:alnum:]_-]/-}
-if tmux -V >/dev/null 2>&1; then
-  exec tmux new-session -A -s \"\$session\" ${agent_command@Q}
+# The far side's own spelling of "not installed": a window that opens and
+# closes again at once explains nothing, so it stays up long enough to read.
+# The launcher is checked as well as the agent, since OpenClaw's is Omarchy's.
+# type -P rather than omarchy-cmd-present, which is on this machine, not there.
+for needed in "$agent" "${command[0]}"; do
+  if ! type -P "$needed" >/dev/null; then
+    echo "$needed is not installed on $HOSTNAME." >&2
+    echo "Install it there, or run it on the machine you launched from with: omarchy agent --local" >&2
+    read -rsn1 -p "Press any key to close." 2>&1
+    exit 1
+  fi
+done
+
+# Neither tmux nor every agent will run under a TERM the far side has no
+# terminfo for, and a terminal's own name (xterm-ghostty, xterm-kitty) often is
+# one.
+infocmp "$TERM" >/dev/null 2>&1 || export TERM=xterm-256color
+
+# Probed by running it, the way this repo probes any other command it does
+# not own -- and omarchy-cmd-present is no help here, since the command being
+# asked about is on the other machine. A machine without tmux runs the agent
+# directly.
+if ! tmux -V >/dev/null 2>&1; then
+  exec "${command[@]}"
 fi
-exec $agent_command"
 
+# tmux is what makes a remote agent survive its window: a closed lid or a
+# dropped tunnel would otherwise kill work on a machine that is still running
+# fine. The session is named for the agent and the directory, so the agent key
+# resumes the conversation already there, while switching the default agent
+# starts the new one rather than reopening the old.
+session=omarchy-agent-$agent-${PWD##*/}
+session=${session//[^[:alnum:]_-]/-}
+
+# A prompt is new work, and attaching would drop it on the floor: tmux ignores
+# the command of a session that already exists. So a prompted launch takes the
+# next free name and leaves the running conversation alone.
+if [[ -n $fresh ]] && tmux has-session -t "=$session" 2>/dev/null; then
+  n=2
+  while tmux has-session -t "=$session-$n" 2>/dev/null; do
+    n=$((n + 1))
+  done
+  session=$session-$n
+fi
+
+# Created detached so the session can be told to detach its client when it
+# ends. Omarchy's own tmux.conf turns detach-on-destroy off, which would move
+# the window into whatever other session is running there instead of closing.
+# env carries this shell's PATH, mise shims included, into a tmux server that
+# may have been started long ago from a shell without them. The size is the
+# window's, so the agent draws its first screen at the width it will be seen.
+if ! tmux has-session -t "=$session" 2>/dev/null; then
+  read -r rows columns < <(stty size 2>/dev/null)
+  tmux new-session -d -s "$session" -x "${columns:-80}" -y "${rows:-24}" env "PATH=$PATH" "${command[@]}"
+  tmux set-option -t "=$session:" detach-on-destroy on
+fi
+
+exec tmux attach-session -t "=$session"
+REMOTE
+)"
+
+  # The login shell on the far side reads this line first, and it may be fish
+  # or zsh rather than bash, so it gets nothing to interpret: the script
+  # travels as base64 inside plain single quotes and bash decodes it.
   # -lic rather than -lc: agents are mise shims, and mise activates from the
   # interactive half of the remote shell's startup files, which a login shell
   # running a command skips. The TTY ssh -t forces is what makes -i safe.
-  # Quoted twice on purpose -- once so the remote shell hands bash a single
-  # command, once so a prompt carrying quotes or semicolons stays an argument.
   # The control socket makes every launch after the first reuse one connection,
   # which is what keeps asking "is it still running over there?" cheap enough to
   # ask often. In the runtime directory because it is per-user and cleared on
-  # logout, unlike a socket left in ~/.ssh.
+  # logout, unlike a socket left in ~/.ssh, and named by %C because a long host
+  # name spelled out would overrun the socket path limit.
   command=(ssh -t
     -o ServerAliveInterval=30 -o ConnectTimeout=10
     -o ControlMaster=auto -o ControlPersist=10m
-    -o "ControlPath=${XDG_RUNTIME_DIR:-/tmp}/omarchy-agent-ssh-%r@%h:%p"
-    "$agent_host" -- "bash -lic ${remote_command@Q}")
+    -o "ControlPath=${XDG_RUNTIME_DIR:-/tmp}/omarchy-agent-ssh-%C"
+    "$agent_host" -- "bash -lic 'eval \"\$(printf %s $(base64 -w0 <<<"$remote_script") | base64 -d)\"'")
 fi
 
 if [[ $inline == "true" ]]; then
