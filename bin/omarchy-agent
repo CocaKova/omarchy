@@ -206,21 +206,36 @@ fi
 
 # tmux is what makes a remote agent survive its window: a closed lid or a
 # dropped tunnel would otherwise kill work on a machine that is still running
-# fine. The session is named for the agent and the directory, so the agent key
-# resumes the conversation already there, while switching the default agent
-# starts the new one rather than reopening the old.
-session=omarchy-agent-$agent-${PWD##*/}
-session=${session//[^[:alnum:]_-]/-}
+# fine. Sessions are named for the agent and the directory, so switching the
+# default agent starts the new one rather than reopening the old.
+base=omarchy-agent-$agent-${PWD##*/}
+base=${base//[^[:alnum:]_-]/-}
+session=$base
 
-# A prompt is new work, and attaching would drop it on the floor: tmux ignores
-# the command of a session that already exists. So a prompted launch takes the
-# next free name and leaves the running conversation alone.
-if [[ -n $fresh ]] && tmux has-session -t "=$session" 2>/dev/null; then
-  n=2
-  while tmux has-session -t "=$session-$n" 2>/dev/null; do
-    n=$((n + 1))
-  done
-  session=$session-$n
+if [[ -n $fresh ]]; then
+  # A prompt is new work, and attaching would drop it on the floor: tmux
+  # ignores the command of a session that already exists. So a prompted launch
+  # takes the next free name and leaves the running conversation alone.
+  if tmux has-session -t "=$session" 2>/dev/null; then
+    n=2
+    while tmux has-session -t "=$session-$n" 2>/dev/null; do
+      n=$((n + 1))
+    done
+    session=$session-$n
+  fi
+else
+  # The agent key resumes the conversation already there. Prompts leave
+  # numbered sessions behind, and the one to return to is the one last looked
+  # at, whichever number it has, so the key never starts a second agent beside
+  # a running one.
+  latest=-1
+  while read -r name attached; do
+    [[ $name == "$base" || $name =~ ^$base-[0-9]+$ ]] || continue
+    if ((${attached:-0} > latest)); then
+      latest=${attached:-0}
+      session=$name
+    fi
+  done < <(tmux list-sessions -F '#{session_name} #{session_last_attached}' 2>/dev/null)
 fi
 
 # Created detached so the session can be told to detach its client when it
@@ -231,7 +246,17 @@ fi
 # window's, so the agent draws its first screen at the width it will be seen.
 if ! tmux has-session -t "=$session" 2>/dev/null; then
   read -r rows columns < <(stty size 2>/dev/null)
-  tmux new-session -d -s "$session" -x "${columns:-80}" -y "${rows:-24}" env "PATH=$PATH" "${command[@]}"
+  ((rows > 0 && columns > 0)) || rows=24 columns=80
+
+  # tmux reads a word ending in ; as the end of its own command and drops the
+  # ;, so a prompt ending in one has it escaped for tmux to hand back intact.
+  tmux_command=()
+  for word in env "PATH=$PATH" "${command[@]}"; do
+    [[ $word == *';' ]] && word=${word%;}'\;'
+    tmux_command+=("$word")
+  done
+
+  tmux new-session -d -s "$session" -x "$columns" -y "$rows" "${tmux_command[@]}"
   tmux set-option -t "=$session:" detach-on-destroy on
 fi
 

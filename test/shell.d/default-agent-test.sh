@@ -53,19 +53,31 @@ printf '%s\n' "$1" >>"$OMARCHY_TEST_AGENT_REACHABLE_LOG"
 [[ ${OMARCHY_TEST_AGENT_HOST_UNREACHABLE:-false} != "true" ]]
 SH
 
-# The far side of an ssh launch. It runs the script the way the remote login
-# shell's bash would, with the base64 the launcher wrapped it in decoded, in a
-# home and a PATH of its own so nothing on this machine answers for the remote.
+# The far side of an ssh launch. sshd hands the whole command line to the login
+# shell, so it is run whole, wrapper and all, in a home and a PATH of its own so
+# nothing on this machine answers for the remote.
 cat >"$mock_bin/omarchy-test-far-side" <<'SH'
 #!/bin/bash
-remote=$1
-[[ $remote =~ printf\ %s\ ([A-Za-z0-9+/=]+)\ \| ]] || {
-  echo "far side got no script: $remote" >&2
-  exit 2
-}
 cd "$OMARCHY_TEST_FAR_HOME" &&
   exec env HOME="$OMARCHY_TEST_FAR_HOME" PATH="$OMARCHY_TEST_FAR_BIN:/usr/bin:/bin" \
-    bash -c "$(base64 -d <<<"${BASH_REMATCH[1]}")"
+    bash -c "$1"
+SH
+
+# The far side's bash, without this machine's startup files or a terminal for
+# -i to take control of.
+cat >"$far_bin/bash" <<'SH'
+#!/bin/sh
+if [ "$1" = -lic ]; then
+  shift
+  exec /bin/bash --noprofile --norc -c "$@"
+fi
+exec /bin/bash "$@"
+SH
+
+# The far side's terminal, of the size a test gives it, or none at all.
+cat >"$far_bin/stty" <<'SH'
+#!/bin/bash
+[[ -n ${OMARCHY_TEST_STTY_SIZE:-} ]] && echo "$OMARCHY_TEST_STTY_SIZE"
 SH
 
 cat >"$mock_bin/ssh" <<'SH'
@@ -78,6 +90,19 @@ SH
 # calls before it.
 cat >"$far_bin/tmux" <<'SH'
 #!/bin/bash
+# tmux reads a word ending in ; as the end of its own command and drops the ;,
+# and a word ending in \; as ending in a literal ;.
+args=()
+for arg in "$@"; do
+  if [[ $arg == *'\;' ]]; then
+    arg=${arg%'\;'}';'
+  elif [[ $arg == *';' ]]; then
+    arg=${arg%;}
+  fi
+  args+=("$arg")
+done
+set -- "${args[@]}"
+
 # One call per line, quoted, so a test can read any call back as its argv.
 printf '%q ' "$@" >>"$OMARCHY_TEST_TMUX_LOG"
 printf '\n' >>"$OMARCHY_TEST_TMUX_LOG"
@@ -102,7 +127,18 @@ list-sessions)
     echo "no server running on /tmp/tmux-1000/default" >&2
     exit 1
   }
-  cat "$OMARCHY_TEST_TMUX_SESSIONS"
+  # Sessions are kept in the order they were last attached, so a line's
+  # number stands in for the time, and listed by name, as tmux lists them.
+  if [[ $* == *session_last_attached* ]]; then
+    awk '{ print $0, NR }' "$OMARCHY_TEST_TMUX_SESSIONS" | sort
+  else
+    cat "$OMARCHY_TEST_TMUX_SESSIONS"
+  fi
+  ;;
+attach-session)
+  name=${3#=}
+  { grep -Fxv "$name" "$OMARCHY_TEST_TMUX_SESSIONS" || true; echo "$name"; } >"$OMARCHY_TEST_TMUX_SESSIONS.new"
+  mv "$OMARCHY_TEST_TMUX_SESSIONS.new" "$OMARCHY_TEST_TMUX_SESSIONS"
   ;;
 kill-session)
   name=${3#=}
@@ -966,7 +1002,8 @@ tmux_calls() {
 # the agent as one literal argument and nothing in it runs.
 : >"$tmux_sessions"
 : >"$tmux_log"
-omarchy-test-far-side "$remote_shell_command"
+omarchy-test-far-side "$remote_shell_command" 2>"$test_tmp/far-side" ||
+  fail "the far side's bash runs the launch as sent" "$(cat "$test_tmp/far-side")"
 mapfile -d '' -t new_session < <(tmux_calls new-session)
 [[ ${new_session[2]:-} == "-s" && ${new_session[3]:-} == "omarchy-agent-hermes-Work" ]] ||
   fail "a remote agent runs in a tmux session named for it and ~/Work" "argv: ${new_session[*]}"
@@ -1001,7 +1038,8 @@ mapfile -d '' -t new_session < <(tmux_calls new-session)
   fail "a prompt given while a session runs starts a new one" "argv: ${new_session[*]}"
 pass "a prompt given while a session runs is delivered to a new one"
 
-# The agent key with no prompt resumes the conversation that is already there.
+# The agent key with no prompt resumes the conversation that is already there:
+# the one the prompt just opened, since that is the one last attached.
 : >"$launch_log"
 : >"$tmux_log"
 omarchy-agent
@@ -1010,9 +1048,58 @@ omarchy-test-far-side "${launch_args[-1]}"
 [[ -z $(tmux_calls new-session) ]] ||
   fail "the agent key starts no rival agent over a running one" "tmux: $(cat "$tmux_log")"
 mapfile -d '' -t attach < <(tmux_calls attach-session)
-[[ ${attach[*]} == "attach-session -t =omarchy-agent-hermes-Work" ]] ||
+[[ ${attach[*]} == "attach-session -t =omarchy-agent-hermes-Work-2" ]] ||
   fail "the agent key resumes the running session" "argv: ${attach[*]}"
 pass "the agent key resumes the session already running there"
+
+# Prompts leave numbered sessions behind, and the agent key goes back to the
+# one last attached, numbered or not, rather than starting another beside it.
+: >"$launch_log"
+omarchy-agent
+mapfile -d '' -t launch_args <"$launch_log"
+agent_key_command=${launch_args[-1]}
+printf '%s\n' omarchy-agent-hermes-Work-2 >"$tmux_sessions"
+: >"$tmux_log"
+omarchy-test-far-side "$agent_key_command"
+mapfile -d '' -t attach < <(tmux_calls attach-session)
+[[ -z $(tmux_calls new-session) && ${attach[*]} == "attach-session -t =omarchy-agent-hermes-Work-2" ]] ||
+  fail "the agent key resumes a numbered session left running" "tmux: $(cat "$tmux_log")"
+printf '%s\n' omarchy-agent-hermes-Work-3 omarchy-agent-hermes-Work omarchy-agent-hermes-Work-2 omarchy-agent-pi-Work-4 >"$tmux_sessions"
+: >"$tmux_log"
+omarchy-test-far-side "$agent_key_command"
+mapfile -d '' -t attach < <(tmux_calls attach-session)
+[[ -z $(tmux_calls new-session) && ${attach[*]} == "attach-session -t =omarchy-agent-hermes-Work-2" ]] ||
+  fail "the agent key resumes the session last attached" "tmux: $(cat "$tmux_log")"
+pass "the agent key resumes the session last attached, numbered or not"
+
+# tmux ends its own command at a word ending in ;, and a prompt is the last
+# word, so a prompt ending in one still reaches the agent whole.
+for prompt_end in 'x = 1;' 'ends \;' 'two;;' ';'; do
+  : >"$launch_log"
+  : >"$tmux_sessions"
+  : >"$tmux_log"
+  omarchy-agent-prompt "Explain this line: $prompt_end"
+  mapfile -d '' -t launch_args <"$launch_log"
+  omarchy-test-far-side "${launch_args[-1]}"
+  mapfile -d '' -t new_session < <(tmux_calls new-session)
+  [[ ${new_session[-1]:-} == "--query=Explain this line: $prompt_end" ]] ||
+    fail "a prompt ending in ; reaches the agent whole" "argv: ${new_session[*]}"
+done
+pass "a prompt ending in ; reaches the agent whole"
+
+# The window's own size, and 80x24 from a terminal that reports none or 0 0,
+# which tmux would refuse.
+for size in "50 200:200:50" "0 0:80:24" ":80:24"; do
+  : >"$tmux_sessions"
+  : >"$tmux_log"
+  OMARCHY_TEST_STTY_SIZE=${size%%:*} omarchy-test-far-side "$agent_key_command"
+  mapfile -d '' -t new_session < <(tmux_calls new-session)
+  expected=${size#*:}
+  [[ ${new_session[4]:-} == "-x" && ${new_session[5]:-} == "${expected%:*}" &&
+    ${new_session[6]:-} == "-y" && ${new_session[7]:-} == "${expected#*:}" ]] ||
+    fail "the session is sized to a usable window" "size ${size%%:*}: ${new_session[*]}"
+done
+pass "the session is sized to the window, or to 80x24 without a usable one"
 
 # Switching the default agent starts that agent, rather than reopening the one
 # the old default left running.
