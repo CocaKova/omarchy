@@ -90,63 +90,86 @@ SH
 # calls before it.
 cat >"$far_bin/tmux" <<'SH'
 #!/bin/bash
-# tmux reads a word ending in ; as the end of its own command and drops the ;,
-# and a word ending in \; as ending in a literal ;.
-args=()
-for arg in "$@"; do
-  if [[ $arg == *'\;' ]]; then
-    arg=${arg%'\;'}';'
-  elif [[ $arg == *';' ]]; then
-    arg=${arg%;}
-  fi
-  args+=("$arg")
-done
-set -- "${args[@]}"
-
-# One call per line, quoted, so a test can read any call back as its argv.
-printf '%q ' "$@" >>"$OMARCHY_TEST_TMUX_LOG"
-printf '\n' >>"$OMARCHY_TEST_TMUX_LOG"
 touch "$OMARCHY_TEST_TMUX_SESSIONS"
 
-case $1 in
--V)
-  [[ ${OMARCHY_TEST_NO_TMUX:-false} != "true" ]]
-  ;;
-has-session)
-  grep -Fxq "${3#=}" "$OMARCHY_TEST_TMUX_SESSIONS"
-  ;;
-new-session)
-  printf '%s\n' "$4" >>"$OMARCHY_TEST_TMUX_SESSIONS"
-  ;;
-list-sessions)
-  if [[ -n ${OMARCHY_TEST_TMUX_LIST_ERROR:-} ]]; then
-    echo "$OMARCHY_TEST_TMUX_LIST_ERROR" >&2
-    exit 1
-  fi
-  [[ -s $OMARCHY_TEST_TMUX_SESSIONS ]] || {
-    echo "no server running on /tmp/tmux-1000/default" >&2
-    exit 1
-  }
-  # Sessions are kept in the order they were last attached, so a line's
-  # number stands in for the time, and listed by name, as tmux lists them.
-  if [[ $* == *session_last_attached* ]]; then
-    awk '{ print $0, NR }' "$OMARCHY_TEST_TMUX_SESSIONS" | sort
+run() {
+  case $1 in
+  -V)
+    [[ ${OMARCHY_TEST_NO_TMUX:-false} != "true" ]]
+    ;;
+  has-session)
+    # A session another launch starts just after this answer is one the
+    # answer cannot know about.
+    [[ ${OMARCHY_TEST_TMUX_UNSEEN:-false} != "true" ]] &&
+      grep -Fxq "${3#=}" "$OMARCHY_TEST_TMUX_SESSIONS"
+    ;;
+  new-session)
+    if [[ -n ${OMARCHY_TEST_TMUX_NEW_ERROR:-} ]]; then
+      echo "$OMARCHY_TEST_TMUX_NEW_ERROR" >&2
+      exit 1
+    fi
+    if grep -Fxq "$4" "$OMARCHY_TEST_TMUX_SESSIONS"; then
+      echo "duplicate session: $4" >&2
+      exit 1
+    fi
+    printf '%s\n' "$4" >>"$OMARCHY_TEST_TMUX_SESSIONS"
+    ;;
+  list-sessions)
+    if [[ -n ${OMARCHY_TEST_TMUX_LIST_ERROR:-} ]]; then
+      echo "$OMARCHY_TEST_TMUX_LIST_ERROR" >&2
+      exit 1
+    fi
+    [[ -s $OMARCHY_TEST_TMUX_SESSIONS ]] || {
+      echo "no server running on /tmp/tmux-1000/default" >&2
+      exit 1
+    }
+    # Sessions are kept in the order they were last used, so a line's number
+    # stands in for the time, and listed by name, as tmux lists them.
+    if [[ $* == *session_activity* ]]; then
+      awk '{ print NR, $0 }' "$OMARCHY_TEST_TMUX_SESSIONS" | sort -k2
+    else
+      cat "$OMARCHY_TEST_TMUX_SESSIONS"
+    fi
+    ;;
+  attach-session)
+    name=${3#=}
+    grep -Fxq "$name" "$OMARCHY_TEST_TMUX_SESSIONS" || {
+      echo "can't find session: $name" >&2
+      exit 1
+    }
+    { grep -Fxv "$name" "$OMARCHY_TEST_TMUX_SESSIONS" || true; echo "$name"; } >"$OMARCHY_TEST_TMUX_SESSIONS.new"
+    mv "$OMARCHY_TEST_TMUX_SESSIONS.new" "$OMARCHY_TEST_TMUX_SESSIONS"
+    ;;
+  kill-session)
+    name=${3#=}
+    grep -Fxq "$name" "$OMARCHY_TEST_TMUX_SESSIONS" || exit 1
+    grep -Fxv "$name" "$OMARCHY_TEST_TMUX_SESSIONS" >"$OMARCHY_TEST_TMUX_SESSIONS.new" || true
+    mv "$OMARCHY_TEST_TMUX_SESSIONS.new" "$OMARCHY_TEST_TMUX_SESSIONS"
+    ;;
+  esac || exit
+
+  # One line per call that took effect, quoted, so a test can read what tmux
+  # did back as argv.
+  printf '%q ' "$@" >>"$OMARCHY_TEST_TMUX_LOG"
+  printf '\n' >>"$OMARCHY_TEST_TMUX_LOG"
+}
+
+# tmux reads a word ending in ; as the end of a command and drops the ;, and a
+# word ending in \; as ending in a literal ;. The commands run in turn, and the
+# first to fail ends the call.
+call=()
+for arg in "$@"; do
+  if [[ $arg == *'\;' ]]; then
+    call+=("${arg%'\;'};")
+  elif [[ $arg == *';' ]]; then
+    [[ -z ${arg%;} ]] || call+=("${arg%;}")
+    run "${call[@]}"
+    call=()
   else
-    cat "$OMARCHY_TEST_TMUX_SESSIONS"
+    call+=("$arg")
   fi
-  ;;
-attach-session)
-  name=${3#=}
-  { grep -Fxv "$name" "$OMARCHY_TEST_TMUX_SESSIONS" || true; echo "$name"; } >"$OMARCHY_TEST_TMUX_SESSIONS.new"
-  mv "$OMARCHY_TEST_TMUX_SESSIONS.new" "$OMARCHY_TEST_TMUX_SESSIONS"
-  ;;
-kill-session)
-  name=${3#=}
-  grep -Fxq "$name" "$OMARCHY_TEST_TMUX_SESSIONS" || exit 1
-  grep -Fxv "$name" "$OMARCHY_TEST_TMUX_SESSIONS" >"$OMARCHY_TEST_TMUX_SESSIONS.new" || true
-  mv "$OMARCHY_TEST_TMUX_SESSIONS.new" "$OMARCHY_TEST_TMUX_SESSIONS"
-  ;;
-esac
+done
+((${#call[@]} == 0)) || run "${call[@]}"
 SH
 
 # The agents themselves, for a far side without tmux.
@@ -1039,7 +1062,7 @@ mapfile -d '' -t new_session < <(tmux_calls new-session)
 pass "a prompt given while a session runs is delivered to a new one"
 
 # The agent key with no prompt resumes the conversation that is already there:
-# the one the prompt just opened, since that is the one last attached.
+# the one the prompt just opened, since that is the one last used.
 : >"$launch_log"
 : >"$tmux_log"
 omarchy-agent
@@ -1053,7 +1076,7 @@ mapfile -d '' -t attach < <(tmux_calls attach-session)
 pass "the agent key resumes the session already running there"
 
 # Prompts leave numbered sessions behind, and the agent key goes back to the
-# one last attached, numbered or not, rather than starting another beside it.
+# one last used, numbered or not, rather than starting another beside it.
 : >"$launch_log"
 omarchy-agent
 mapfile -d '' -t launch_args <"$launch_log"
@@ -1069,8 +1092,45 @@ printf '%s\n' omarchy-agent-hermes-Work-3 omarchy-agent-hermes-Work omarchy-agen
 omarchy-test-far-side "$agent_key_command"
 mapfile -d '' -t attach < <(tmux_calls attach-session)
 [[ -z $(tmux_calls new-session) && ${attach[*]} == "attach-session -t =omarchy-agent-hermes-Work-2" ]] ||
-  fail "the agent key resumes the session last attached" "tmux: $(cat "$tmux_log")"
-pass "the agent key resumes the session last attached, numbered or not"
+  fail "the agent key resumes the session last used" "tmux: $(cat "$tmux_log")"
+pass "the agent key resumes the session last used, numbered or not"
+
+# A name is free when tmux creates it, not when it was asked about: another
+# launch can start a session under it in between, and joining that would lose
+# the prompt. A session has-session cannot see stands in for one started just
+# after the question.
+printf '%s\n' omarchy-agent-hermes-Work >"$tmux_sessions"
+: >"$tmux_log"
+OMARCHY_TEST_TMUX_UNSEEN=true omarchy-test-far-side "$remote_shell_command"
+mapfile -d '' -t new_session < <(tmux_calls new-session)
+mapfile -d '' -t attach < <(tmux_calls attach-session)
+[[ ${new_session[3]:-} == "omarchy-agent-hermes-Work-2" && ${new_session[-1]:-} == "--query=$remote_prompt" &&
+  ${attach[*]} == "attach-session -t =omarchy-agent-hermes-Work-2" ]] ||
+  fail "a prompt never joins a session another launch has just started" "tmux: $(cat "$tmux_log")"
+pass "a prompt never joins a session another launch has just started"
+
+# Without a prompt, that session is the conversation to join, not a reason to
+# start a rival beside it.
+: >"$tmux_log"
+OMARCHY_TEST_TMUX_UNSEEN=true omarchy-test-far-side "$agent_key_command"
+mapfile -d '' -t attach < <(tmux_calls attach-session)
+[[ -z $(tmux_calls new-session) && ${attach[*]} == "attach-session -t =omarchy-agent-hermes-Work-2" ]] ||
+  fail "the agent key joins a session another launch has just started" "tmux: $(cat "$tmux_log")"
+pass "the agent key joins a session another launch has just started"
+
+# Any other refusal is shown where the window can show it, rather than
+# attaching to nothing and closing.
+: >"$tmux_sessions"
+: >"$tmux_log"
+if OMARCHY_TEST_TMUX_NEW_ERROR="server exited unexpectedly" \
+  omarchy-test-far-side "$remote_shell_command" </dev/null >"$test_tmp/far-new-error" 2>&1; then
+  fail "a session tmux refuses to start fails the launch"
+fi
+grep -q "server exited unexpectedly" "$test_tmp/far-new-error" ||
+  fail "a session tmux refuses to start says why" "$(cat "$test_tmp/far-new-error")"
+[[ -z $(tmux_calls attach-session) ]] ||
+  fail "a session tmux refuses to start is not attached" "tmux: $(cat "$tmux_log")"
+pass "a session tmux refuses to start is reported in the window"
 
 # tmux ends its own command at a word ending in ;, and a prompt is the last
 # word, so a prompt ending in one still reaches the agent whole.
@@ -1127,13 +1187,13 @@ pass "a remote machine without tmux still runs the agent"
 # than failing inside a tmux session that closes the window with it.
 : >"$launch_log"
 : >"$tmux_log"
-printf '%s\n' "codex" >"$agent_file"
+printf '%s\n' "ori" >"$agent_file"
 omarchy-agent
 mapfile -d '' -t launch_args <"$launch_log"
 if omarchy-test-far-side "${launch_args[-1]}" </dev/null >"$test_tmp/far-missing" 2>&1; then
   fail "an agent missing on the remote host fails the launch"
 fi
-grep -q "codex is not installed on" "$test_tmp/far-missing" ||
+grep -q "ori is not installed on" "$test_tmp/far-missing" ||
   fail "an agent missing on the remote host is named" "$(cat "$test_tmp/far-missing")"
 grep -q "omarchy agent --local" "$test_tmp/far-missing" ||
   fail "an agent missing on the remote host points at --local" "$(cat "$test_tmp/far-missing")"

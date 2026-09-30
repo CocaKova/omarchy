@@ -178,17 +178,21 @@ command=(${command[*]@Q})
 $(cat <<'REMOTE'
 [[ -d ~/Work ]] && cd ~/Work
 
-# The far side's own spelling of "not installed": a window that opens and
-# closes again at once explains nothing, so it stays up long enough to read.
-# The launcher is checked as well as the agent, since OpenClaw's is Omarchy's.
-# type -P rather than omarchy-cmd-present, which is on this machine, not there.
+# A window that opens and closes again at once explains nothing, so a failure
+# over there stays up long enough to read.
+fail() {
+  printf '%s\n' "$@" >&2
+  read -rsn1 -p "Press any key to close." 2>&1
+  exit 1
+}
+
+# The far side's own spelling of "not installed". The launcher is checked as
+# well as the agent, since OpenClaw's is Omarchy's. type -P rather than
+# omarchy-cmd-present, which is on this machine, not there.
 for needed in "$agent" "${command[0]}"; do
-  if ! type -P "$needed" >/dev/null; then
-    echo "$needed is not installed on $HOSTNAME." >&2
-    echo "Install it there, or run it on the machine you launched from with: omarchy agent --local" >&2
-    read -rsn1 -p "Press any key to close." 2>&1
-    exit 1
-  fi
+  type -P "$needed" >/dev/null ||
+    fail "$needed is not installed on $HOSTNAME." \
+      "Install it there, or run it on the machine you launched from with: omarchy agent --local"
 done
 
 # Neither tmux nor every agent will run under a TERM the far side has no
@@ -212,39 +216,29 @@ base=omarchy-agent-$agent-${PWD##*/}
 base=${base//[^[:alnum:]_-]/-}
 session=$base
 
-if [[ -n $fresh ]]; then
-  # A prompt is new work, and attaching would drop it on the floor: tmux
-  # ignores the command of a session that already exists. So a prompted launch
-  # takes the next free name and leaves the running conversation alone.
-  if tmux has-session -t "=$session" 2>/dev/null; then
-    n=2
-    while tmux has-session -t "=$session-$n" 2>/dev/null; do
-      n=$((n + 1))
-    done
-    session=$session-$n
-  fi
-else
-  # The agent key resumes the conversation already there. Prompts leave
-  # numbered sessions behind, and the one to return to is the one last looked
-  # at, whichever number it has, so the key never starts a second agent beside
-  # a running one.
+# The agent key resumes the conversation already there. Prompts leave
+# numbered sessions behind, and the one to return to is the one last used,
+# whichever number it has, so the key never starts a second agent beside a
+# running one. tmux counts starting, attaching and typing as use.
+if [[ -z $fresh ]]; then
   latest=-1
-  while read -r name attached; do
+  while read -r used name; do
     [[ $name == "$base" || $name =~ ^$base-[0-9]+$ ]] || continue
-    if ((${attached:-0} > latest)); then
-      latest=${attached:-0}
+    if ((used > latest)); then
+      latest=$used
       session=$name
     fi
-  done < <(tmux list-sessions -F '#{session_name} #{session_last_attached}' 2>/dev/null)
+  done < <(tmux list-sessions -F '#{session_activity} #{session_name}' 2>/dev/null)
 fi
 
 # Created detached so the session can be told to detach its client when it
-# ends. Omarchy's own tmux.conf turns detach-on-destroy off, which would move
-# the window into whatever other session is running there instead of closing.
+# ends, in the same tmux call so no window attaches before it is told. Omarchy's
+# own tmux.conf turns detach-on-destroy off, which would move the window into
+# whatever other session is running there instead of closing.
 # env carries this shell's PATH, mise shims included, into a tmux server that
 # may have been started long ago from a shell without them. The size is the
 # window's, so the agent draws its first screen at the width it will be seen.
-if ! tmux has-session -t "=$session" 2>/dev/null; then
+if [[ -n $fresh ]] || ! tmux has-session -t "=$session" 2>/dev/null; then
   read -r rows columns < <(stty size 2>/dev/null)
   ((rows > 0 && columns > 0)) || rows=24 columns=80
 
@@ -256,8 +250,24 @@ if ! tmux has-session -t "=$session" 2>/dev/null; then
     tmux_command+=("$word")
   done
 
-  tmux new-session -d -s "$session" -x "$columns" -y "$rows" "${tmux_command[@]}"
-  tmux set-option -t "=$session:" detach-on-destroy on
+  # A prompt is new work, and attaching would drop it on the floor: tmux
+  # ignores the command of a session that already exists. So a prompted launch
+  # takes the first free name of the base, then -2, -3 and on, and leaves a
+  # running conversation alone. A name is free when tmux creates it: asking
+  # first would leave a moment in which another launch takes it, and this one
+  # would then attach to that session with its prompt lost.
+  n=1
+  until error=$(tmux new-session -d -s "$session" -x "$columns" -y "$rows" "${tmux_command[@]}" \; \
+    set-option -t "=$session:" detach-on-destroy on 2>&1); do
+    [[ $error == "duplicate session: "* ]] || fail "$error"
+
+    # Without a prompt, a session another launch has just started is the
+    # conversation to join.
+    [[ -n $fresh ]] || break
+
+    n=$((n + 1))
+    session=$base-$n
+  done
 fi
 
 exec tmux attach-session -t "=$session"
