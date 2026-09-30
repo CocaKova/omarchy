@@ -996,8 +996,6 @@ done
   ${launch_args[separator - 1]} == "gpu-box" &&
   ${launch_args[separator]} == "--" ]] ||
   fail "a remote agent launches over ssh" "argv: ${launch_args[*]}"
-[[ ${launch_args[*]} == *"ControlPath="*"%C"* ]] ||
-  fail "a remote agent reuses one connection through a short socket path" "argv: ${launch_args[*]}"
 remote_shell_command=${launch_args[separator + 1]}
 pass "a remote agent launches over ssh under the shared app-id"
 

@@ -280,15 +280,11 @@ REMOTE
   # -lic rather than -lc: agents are mise shims, and mise activates from the
   # interactive half of the remote shell's startup files, which a login shell
   # running a command skips. The TTY ssh -t forces is what makes -i safe.
-  # The control socket makes every launch after the first reuse one connection,
-  # which is what keeps asking "is it still running over there?" cheap enough to
-  # ask often. In the runtime directory because it is per-user and cleared on
-  # logout, unlike a socket left in ~/.ssh, and named by %C because a long host
-  # name spelled out would overrun the socket path limit.
-  command=(ssh -t
-    -o ServerAliveInterval=30 -o ConnectTimeout=10
-    -o ControlMaster=auto -o ControlPersist=10m
-    -o "ControlPath=${XDG_RUNTIME_DIR:-/tmp}/omarchy-agent-ssh-%C"
+  # Every launch dials its own connection rather than sharing one: a shared
+  # connection held open across a suspend is reused after the resume, and the
+  # launch then waits on it until its keepalive gives up, which is just when
+  # the agent key is pressed to get back to the session.
+  command=(ssh -t -o ServerAliveInterval=30 -o ConnectTimeout=10
     "$agent_host" -- "bash -lic 'eval \"\$(printf %s $(base64 -w0 <<<"$remote_script") | base64 -d)\"'")
 fi
 

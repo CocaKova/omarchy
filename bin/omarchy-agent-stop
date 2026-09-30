@@ -74,10 +74,7 @@ stderr=$(mktemp)
 trap 'rm -f "$stderr"' EXIT
 
 set +e
-output=$(ssh -o ConnectTimeout=10 \
-  -o ControlMaster=auto -o ControlPersist=10m \
-  -o "ControlPath=${XDG_RUNTIME_DIR:-/tmp}/omarchy-agent-ssh-%C" \
-  "$agent_host" -- "bash -lic 'eval \"\$(printf %s $(base64 -w0 <<<"$remote_script") | base64 -d)\"'" \
+output=$(ssh -o ConnectTimeout=10 "$agent_host" -- "bash -lic 'eval \"\$(printf %s $(base64 -w0 <<<"$remote_script") | base64 -d)\"'" \
   </dev/null 2>"$stderr")
 ssh_status=$?
 set -e
