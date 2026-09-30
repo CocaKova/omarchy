@@ -28,12 +28,26 @@ if [[ ${1:-} == "--host" ]]; then
     exit 0
   fi
 
+  # ssh would read a host starting with - as one of its own options.
+  if [[ $1 == -* ]]; then
+    echo "Not a host: $1" >&2
+    exit 1
+  fi
+
   mkdir -p "$(dirname "$host_file")"
 
-  if [[ -n $1 ]]; then
+  if [[ $1 == *[![:space:]]* ]]; then
     printf '%s\n' "$1" >"$host_file"
   else
     rm -f "$host_file"
+
+    # An agent chosen while it ran elsewhere may never have been installed
+    # here, and the launcher refuses one that is missing, so coming back runs
+    # the same choice again on this machine.
+    [[ -f $agent_file ]] && read -r agent <"$agent_file"
+    if [[ -n ${agent:-} ]] && omarchy-cmd-missing "$agent"; then
+      exec omarchy-default-agent "$agent"
+    fi
   fi
 
   exit 0

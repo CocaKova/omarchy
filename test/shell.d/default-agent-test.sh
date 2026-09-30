@@ -980,6 +980,17 @@ omarchy-default-agent --host gpu-box
 [[ $(omarchy-default-agent --host) == "gpu-box" ]] || fail "the agent host is recorded and read back"
 pass "the agent host is recorded and read back"
 
+# ssh would read a host starting with - as one of its own options, and a host
+# of nothing but spaces is no host at all.
+if omarchy-default-agent --host --local 2>/dev/null; then
+  fail "a host ssh would read as an option is refused"
+fi
+[[ $(omarchy-default-agent --host) == "gpu-box" ]] || fail "a refused host leaves the old one in place"
+omarchy-default-agent --host " "
+[[ ! -f $host_file ]] || fail "a blank agent host clears it"
+omarchy-default-agent --host gpu-box
+pass "a host ssh would misread is refused, and a blank one clears it"
+
 : >"$launch_log"
 remote_prompt=$' --help !Crash /quit {$(touch must-not-run)}\ntrailing\\ '
 printf '%s\n' "hermes" >"$agent_file"
@@ -1214,10 +1225,27 @@ mapfile -d '' -t launch_args <"$launch_log"
   fail "an agent missing locally still launches remotely" "argv: ${launch_args[*]}"
 pass "a remote agent is chosen without installing it locally"
 
+# Chosen while it ran elsewhere, the agent may never have been installed here,
+# and the launcher refuses one that is missing: bringing it back installs it
+# rather than leaving a keypress that opens nothing.
 : >"$launch_log"
+: >"$terminal_log"
+OMARCHY_TEST_MISSING_COMMAND=claude omarchy-default-agent --host ""
+[[ ! -f $host_file ]] || fail "clearing the agent host removes the file"
+mapfile -d '' -t terminal_args <"$terminal_log"
+[[ ${terminal_args[*]} == "omarchy-default-agent --install claude" ]] ||
+  fail "an agent never installed here is installed when it comes back" "terminal: ${terminal_args[*]}"
+pass "an agent chosen while it ran elsewhere is installed when it comes back"
+
+# One that is installed here already comes back as it is.
+omarchy-default-agent --host gpu-box
+: >"$launch_log"
+: >"$terminal_log"
 omarchy-default-agent --host ""
 [[ ! -f $host_file ]] || fail "clearing the agent host removes the file"
 [[ -z $(omarchy-default-agent --host) ]] || fail "a cleared agent host reads back empty"
+[[ ! -s $terminal_log && ! -s $launch_log ]] ||
+  fail "clearing the host of an agent installed here only clears it"
 printf '%s\n' "pi" >"$agent_file"
 omarchy-agent
 assert_launched pi "runs locally again once the host is cleared" pi
@@ -1289,8 +1317,6 @@ pass "the agent host is checked before its window is spawned"
 omarchy-agent --local
 [[ ! -s $reachable_log ]] || fail "--local never probes a remote host"
 pass "--local skips the reachability check entirely"
-
-omarchy-default-agent --host ""
 
 # A session that outlives its window needs a way to end it, or the sessions
 # pile up on the machine nobody is looking at.
