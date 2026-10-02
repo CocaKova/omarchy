@@ -259,7 +259,12 @@ if [[ -n $fresh ]] || ! tmux has-session -t "=$session" 2>/dev/null; then
   n=1
   until error=$(tmux new-session -d -s "$session" -x "$columns" -y "$rows" "${tmux_command[@]}" \; \
     set-option -t "=$session:" detach-on-destroy on 2>&1); do
-    [[ $error == "duplicate session: "* ]] || fail "$error"
+    # tmux takes a command of about 16 KB, prompt included.
+    if [[ $error == "command too long" ]]; then
+      fail "The prompt is too long for tmux on $HOSTNAME." "Save it to a file there and ask $agent to read it."
+    elif [[ $error != "duplicate session: "* ]]; then
+      fail "$error"
+    fi
 
     # Without a prompt, a session another launch has just started is the
     # conversation to join.
@@ -284,8 +289,24 @@ REMOTE
   # connection held open across a suspend is reused after the resume, and the
   # launch then waits on it until its keepalive gives up, which is just when
   # the agent key is pressed to get back to the session.
-  command=(ssh -t -o ServerAliveInterval=30 -o ConnectTimeout=10
-    "$agent_host" -- "bash -lic 'eval \"\$(printf %s $(base64 -w0 <<<"$remote_script") | base64 -d)\"'")
+  remote_command="bash -lic 'eval \"\$(printf %s $(base64 -w0 <<<"$remote_script") | base64 -d)\"'"
+  command=(ssh -t -o ServerAliveInterval=30 -o ConnectTimeout=10 "$agent_host" -- "$remote_command")
+
+  # Linux caps any one argument at 32 pages, 128 KiB on most machines, and this
+  # line is a single argument both here and in the far side's shell, which sshd
+  # hands it to whole. Only a pasted prompt gets near that, and the launch would
+  # otherwise fail with nothing more than "Argument list too long".
+  if ((${#remote_command} >= 128 * 1024)); then
+    if [[ $inline == "true" ]]; then
+      echo "The prompt is too long to send to $agent_host." >&2
+      echo "Save it to a file there and ask $agent to read it." >&2
+    else
+      omarchy-notification-send -u critical "Prompt too long" \
+        "The prompt is too long to send to $agent_host. Save it to a file there and ask $agent to read it."
+    fi
+
+    exit 1
+  fi
 fi
 
 if [[ $inline == "true" ]]; then

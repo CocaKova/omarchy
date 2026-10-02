@@ -1173,6 +1173,18 @@ grep -q "server exited unexpectedly" "$test_tmp/far-new-error" ||
   fail "a session tmux refuses to start is not attached" "tmux: $(cat "$tmux_log")"
 pass "a session tmux refuses to start is reported in the window"
 
+# tmux takes a command of about 16 KB, so a prompt over that has to say so in
+# words a person can act on, not in tmux's.
+: >"$tmux_sessions"
+: >"$tmux_log"
+if OMARCHY_TEST_TMUX_NEW_ERROR="command too long" \
+  omarchy-test-far-side "$remote_shell_command" </dev/null >"$test_tmp/far-too-long" 2>&1; then
+  fail "a prompt tmux cannot take fails the launch"
+fi
+grep -q "The prompt is too long for tmux" "$test_tmp/far-too-long" ||
+  fail "a prompt tmux cannot take says why" "$(cat "$test_tmp/far-too-long")"
+pass "a prompt tmux cannot take is explained in the window"
+
 # tmux ends its own command at a word ending in ;, and a prompt is the last
 # word, so a prompt ending in one still reaches the agent whole.
 for prompt_end in 'x = 1;' 'ends \;' 'two;;' ';'; do
@@ -1338,6 +1350,38 @@ fi
 grep -q "omarchy agent --local" "$test_tmp/unreachable-inline" ||
   fail "an unreachable agent host points at the local escape hatch" "$(cat "$test_tmp/unreachable-inline")"
 pass "an inline launch reports an unreachable host in the terminal it was run from"
+
+# The whole far-side script crosses as one argument, and Linux takes none of
+# 128 KiB or more, so a prompt that would not fit is refused before any window,
+# rather than left to fail with "Argument list too long".
+long_prompt=$(head -c 100000 /dev/zero | tr '\0' x)
+: >"$launch_log"
+: >"$notification_history"
+if omarchy-agent-prompt "$long_prompt" 2>"$test_tmp/long-window"; then
+  fail "a prompt too long to send fails the launch"
+fi
+[[ ! -s $launch_log ]] || fail "a prompt too long to send opens no window"
+mapfile -d '' -t notification <"$notification_history"
+[[ ${notification[*]} == *"too long to send to gpu-box"* ]] ||
+  fail "a prompt too long to send is reported on the desktop" "notification: ${notification[*]} $(cat "$test_tmp/long-window")"
+
+: >"$notification_history"
+if omarchy-agent-prompt --inline "$long_prompt" >"$test_tmp/long-inline" 2>&1; then
+  fail "a prompt too long to send fails an inline launch"
+fi
+[[ ! -s $notification_history ]] ||
+  fail "an inline launch reports a long prompt in the terminal rather than on the desktop"
+grep -q "too long to send to gpu-box" "$test_tmp/long-inline" ||
+  fail "a prompt too long to send is reported in the terminal" "$(cat "$test_tmp/long-inline")"
+pass "a prompt too long to send is reported instead of failing to start"
+
+: >"$launch_log"
+omarchy-agent-prompt "${long_prompt:0:60000}"
+mapfile -d '' -t launch_args <"$launch_log"
+if [[ ${launch_args[1]:-} != "ssh" ]] || ((${#launch_args[-1]} <= 60000)); then
+  fail "a long prompt that fits still launches" "argv: ${launch_args[*]:0:8}"
+fi
+pass "a long prompt that fits still launches"
 
 : >"$reachable_log"
 omarchy-agent
