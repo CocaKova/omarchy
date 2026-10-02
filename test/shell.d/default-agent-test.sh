@@ -80,9 +80,41 @@ cat >"$far_bin/stty" <<'SH'
 [[ -n ${OMARCHY_TEST_STTY_SIZE:-} ]] && echo "$OMARCHY_TEST_STTY_SIZE"
 SH
 
+# Reads its arguments the way OpenSSH does: options, the host, then options
+# again until a -- or the first other word, and what is left joined with spaces
+# into the one line sshd hands the far side. A word ssh would keep for itself
+# never reaches the far side, and one it would send always does.
 cat >"$mock_bin/ssh" <<'SH'
 #!/bin/bash
-exec omarchy-test-far-side "${!#}"
+host=
+while (($#)); do
+  case $1 in
+  --)
+    shift
+    break
+    ;;
+  -[BbcDEeFIiJLlmOoPpQRSWw])
+    shift 2
+    ;;
+  -*)
+    shift
+    ;;
+  *)
+    [[ -z $host ]] || break
+    host=$1
+    shift
+    ;;
+  esac
+done
+if [[ -z $host ]]; then
+  host=${1:-}
+  shift
+fi
+if [[ -z $host ]] || (($# == 0)); then
+  echo "ssh: no host or no command" >&2
+  exit 255
+fi
+exec omarchy-test-far-side "$*"
 SH
 
 # Enough of tmux to hold sessions between calls: the far side asks whether one
